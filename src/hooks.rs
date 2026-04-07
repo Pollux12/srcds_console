@@ -112,6 +112,7 @@ const IMAGE_ORDINAL_FLAG: usize = 0x8000_0000;
 use std::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
 
 static ORIG_WRITE_CONSOLE_OUTPUT_CHAR: AtomicUsize = AtomicUsize::new(0);
+static ORIG_WRITE_CONSOLE_OUTPUT_CHAR_W: AtomicUsize = AtomicUsize::new(0);
 static ORIG_WRITE_CONSOLE_OUTPUT_ATTR: AtomicUsize = AtomicUsize::new(0);
 static ORIG_SET_CURSOR_POS: AtomicUsize = AtomicUsize::new(0);
 static ORIG_SET_BUFFER_SIZE: AtomicUsize = AtomicUsize::new(0);
@@ -175,6 +176,36 @@ unsafe fn capture_status_and_update_title(
         }
     }
 
+    maybe_update_status_line();
+}
+
+/// Capture UTF-16 status text (WriteConsoleOutputCharacterW) and update the bar.
+unsafe fn capture_status_wide_and_update_title(
+    text: *const u16,
+    length: u32,
+    coord: COORD,
+) {
+    let row = coord.Y as usize;
+    let col = coord.X as usize;
+
+    if row < STATUS_MAX_ROWS && length > 0 {
+        let src = std::slice::from_raw_parts(text, length as usize);
+        for (i, &wc) in src.iter().enumerate() {
+            let c = col + i;
+            if c < STATUS_MAX_COLS {
+                STATUS_BUF[row][c] = if wc <= 0x7F { wc as u8 } else { b'?' };
+            }
+        }
+        let end = col + length as usize;
+        if end > STATUS_LEN[row] {
+            STATUS_LEN[row] = end;
+        }
+    }
+
+    maybe_update_status_line();
+}
+
+unsafe fn maybe_update_status_line() {
     // Rate-limited status update
     if STATUS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         let count = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -221,6 +252,8 @@ pub unsafe fn setup_scroll_region() {
     let rows = info.srWindow.Bottom - info.srWindow.Top + 1;
     let cols = (info.srWindow.Right - info.srWindow.Left + 1) as usize;
     if rows < 3 { return; }
+    LAST_SCROLL_ROWS.store(rows as u32, Ordering::Relaxed);
+    LAST_SCROLL_COLS.store(cols as u32, Ordering::Relaxed);
 
     // Set scroll region (all rows except the last), init status line, move cursor to top
     let blank: String = " ".repeat(cols);
@@ -235,10 +268,13 @@ pub unsafe fn setup_scroll_region() {
 pub unsafe fn cleanup_scroll_region() {
     if !STATUS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) { return; }
     write_console_raw("\x1b[r\x1b[999;1H\n");
+    LAST_SCROLL_ROWS.store(0, Ordering::Relaxed);
+    LAST_SCROLL_COLS.store(0, Ordering::Relaxed);
 }
 
 // Track last known terminal size for resize detection
 static LAST_SCROLL_ROWS: AtomicU32 = AtomicU32::new(0);
+static LAST_SCROLL_COLS: AtomicU32 = AtomicU32::new(0);
 
 /// Render the captured status text as a bottom bar using ANSI escape sequences.
 unsafe fn update_status_line() {
@@ -255,6 +291,26 @@ unsafe fn update_status_line() {
     let cols = (info.srWindow.Right - info.srWindow.Left + 1) as usize;
     let rows = info.srWindow.Bottom - info.srWindow.Top + 1;
     if rows < 3 { return; }
+    let rows_u32 = rows as u32;
+
+    // Compute cursor position relative to visible window and clamp to scrollable area.
+    // This avoids restoring into the status bar row after terminal resizes.
+    let mut cursor_row = (info.dwCursorPosition.Y - info.srWindow.Top + 1) as i32;
+    let mut cursor_col = (info.dwCursorPosition.X - info.srWindow.Left + 1) as i32;
+    if cursor_row < 1 {
+        cursor_row = 1;
+    }
+    let max_cursor_row = (rows - 1).max(1) as i32;
+    if cursor_row > max_cursor_row {
+        cursor_row = max_cursor_row;
+    }
+    if cursor_col < 1 {
+        cursor_col = 1;
+    }
+    let max_cursor_col = cols.max(1) as i32;
+    if cursor_col > max_cursor_col {
+        cursor_col = max_cursor_col;
+    }
 
     // Build status text from captured lines
     let mut status = String::with_capacity(cols);
@@ -276,19 +332,28 @@ unsafe fn update_status_line() {
     }
     status.truncate(cols);
 
-    // Only re-set scroll region if terminal size changed (DECSTBM resets cursor to 1,1)
+    // Reconfigure the scroll region on any size change and clear stale bars.
     let prev_rows = LAST_SCROLL_ROWS.load(Ordering::Relaxed);
-    if prev_rows != rows as u32 {
-        LAST_SCROLL_ROWS.store(rows as u32, Ordering::Relaxed);
-        let region = format!("\x1b[1;{}r", rows - 1);
-        write_console_raw(&region);
+    let prev_cols = LAST_SCROLL_COLS.load(Ordering::Relaxed);
+    let resized = prev_rows != rows_u32 || prev_cols != cols as u32;
+    let mut ansi = String::with_capacity(cols + 80);
+    if resized {
+        LAST_SCROLL_ROWS.store(rows_u32, Ordering::Relaxed);
+        LAST_SCROLL_COLS.store(cols as u32, Ordering::Relaxed);
+
+        // Reset previous region first; then clear the previously used status row if still visible.
+        ansi.push_str("\x1b[r");
+        if prev_rows > 0 && prev_rows != rows_u32 && prev_rows <= rows_u32 {
+            ansi.push_str(&format!("\x1b[{};1H\x1b[2K", prev_rows));
+        }
+        ansi.push_str(&format!("\x1b[1;{}r", rows - 1));
     }
 
-    // Save cursor, move to status row, clear line, write status in reverse video, restore cursor
-    let ansi = format!(
-        "\x1b7\x1b[{};1H\x1b[2K\x1b[7m{}\x1b[0m\x1b8",
-        rows, status
-    );
+    // Draw status line and restore cursor explicitly.
+    ansi.push_str(&format!(
+        "\x1b[{};1H\x1b[2K\x1b[7m{}\x1b[0m\x1b[{};{}H",
+        rows, status, cursor_row, cursor_col
+    ));
     write_console_raw(&ansi);
 }
 
@@ -297,6 +362,8 @@ fn save_original(name: &CStr, original: usize) {
     let name = name.to_bytes();
     if name == b"WriteConsoleOutputCharacterA" {
         ORIG_WRITE_CONSOLE_OUTPUT_CHAR.store(original, Ordering::Release);
+    } else if name == b"WriteConsoleOutputCharacterW" {
+        ORIG_WRITE_CONSOLE_OUTPUT_CHAR_W.store(original, Ordering::Release);
     } else if name == b"WriteConsoleOutputAttribute" {
         ORIG_WRITE_CONSOLE_OUTPUT_ATTR.store(original, Ordering::Release);
     } else if name == b"SetConsoleCursorPosition" {
@@ -326,6 +393,21 @@ unsafe extern "system" fn hooked_WriteConsoleOutputCharacterA(
     chars_written: *mut u32,
 ) -> BOOL {
     capture_status_and_update_title(character, length, write_coord);
+    if !chars_written.is_null() {
+        *chars_written = length;
+    }
+    1 // TRUE — pretend we wrote them
+}
+
+#[allow(non_snake_case)]
+unsafe extern "system" fn hooked_WriteConsoleOutputCharacterW(
+    _console: HANDLE,
+    character: *const u16,
+    length: u32,
+    write_coord: COORD,
+    chars_written: *mut u32,
+) -> BOOL {
+    capture_status_wide_and_update_title(character, length, write_coord);
     if !chars_written.is_null() {
         *chars_written = length;
     }
@@ -426,6 +508,10 @@ pub unsafe fn install_console_hooks(module_base: *const u8) -> usize {
         HookEntry {
             func_name: b"WriteConsoleOutputCharacterA\0",
             hook_fn: hooked_WriteConsoleOutputCharacterA as *const () as usize,
+        },
+        HookEntry {
+            func_name: b"WriteConsoleOutputCharacterW\0",
+            hook_fn: hooked_WriteConsoleOutputCharacterW as *const () as usize,
         },
         HookEntry {
             func_name: b"WriteConsoleOutputAttribute\0",
