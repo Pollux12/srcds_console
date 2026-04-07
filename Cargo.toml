@@ -1,0 +1,21 @@
+[package]
+name = "srcds_console"
+version = "0.2.0"
+edition = "2021"
+description = "Drop-in SRCDS console launcher — loads dedicated.dll directly with status bar suppression"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Console",
+    "Win32_System_Environment",
+    "Win32_System_Threading",
+]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
