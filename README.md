@@ -1,5 +1,17 @@
 # srcds_console
 
+> [!IMPORTANT]
+> This is completely vibe-coded with Copilot and is only intended for dev environments, use at your own risk. 
+> I wanted to see if Claude could figure this out, as it's something that has always slightly annoyed me, and it ended up doing quite well.
+
+This is a drop-in replacement for SRCDS that runs inside your existing terminal (e.g. Windows Terminal) instead of spawning its own console window. Based on Alien Swarm's `srcds_console`, but fixes the weird grey status overwrite bug that prevents reading history and also adds support for x64.
+
+Works with Garry's Mod (x64 and x32) and probably other source engine games.
+
+Everything below is AI slop
+
+---
+
 ## Downloads
 
 Grab the latest release from the [Releases page](../../releases):
